@@ -19,7 +19,7 @@ const dbPassword = randomBytes(16).toString('hex');
 const apiKey = randomBytes(24).toString('hex');
 
 const text = readFileSync(example, 'utf8')
-  .replaceAll('change_me_db_password', dbPassword)
+  .replaceAll('DB_pass_change', dbPassword)
   .replaceAll('change_me_api_key_0123456789abcdef', apiKey);
 
 writeFileSync(target, text, { mode: 0o600 });
