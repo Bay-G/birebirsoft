@@ -1,0 +1,7 @@
+node_modules
+.git
+.env*
+tests
+*.md
+# Veri imaja girmez; importer servisi ./data klasörünü volume olarak bağlar (imaj ve build bağlamı küçük kalır)
+data

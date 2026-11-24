@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="tr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>address-services — harita demosu</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.css">
+<style>
+  html, body { height: 100%; margin: 0; font-family: system-ui, sans-serif; }
+  #bar { display: flex; gap: 8px; align-items: center; padding: 8px 12px; background: #f1f5f9; border-bottom: 1px solid #cbd5e1; flex-wrap: wrap; font-size: 14px; }
+  #map { height: calc(100% - 52px); }
+  #status { color: #475569; }
+  #status.err { color: #b91c1c; }
+  input, select, button { padding: 4px 8px; font-size: 14px; }
+</style>
+</head>
+<body>
+<div id="bar">
+  <label>API key <input id="key" type="password" size="22"></label>
+  <button id="save">Kaydet ve yükle</button>
+  <label>İl <select id="prov"></select></label>
+  <span id="status">Haritaya tıklayın: tıklanan nokta için reverse geocoding yapılır.</span>
+</div>
+<div id="map"></div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.js"></script>
+<script>
+  var $ = function (id) { return document.getElementById(id); };
+  var key = '';
+  try { key = localStorage.getItem('apiKey') || ''; } catch (e) {}
+  $('key').value = key;
+
+  var map = L.map('map').setView([39, 35], 6);
+  L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxZoom: 19, attribution: '&copy; OpenStreetMap'
+  }).addTo(map);
+
+  var districtLayer = null, neighborhoodLayer = null, highlightLayer = null, pointMarker = null;
+
+  function setStatus(text, isError) {
+    $('status').textContent = text;
+    $('status').className = isError ? 'err' : '';
+  }
+
+  // Aynı origin'den çağrıldığı için CORS gerekmez; gzip/ETag'i tarayıcı kendisi yönetir.
+  async function api(path) {
+    var res = await fetch(path, { headers: { 'x-api-key': key } });
+    if (!res.ok) {
+      var body = await res.json().catch(function () { return {}; });
+      throw new Error((body.error && body.error.message) || ('HTTP ' + res.status));
+    }
+    return res.json();
+  }
+
+  function replaceLayer(old, data, options) {
+    if (old) map.removeLayer(old);
+    return L.geoJSON(data, options).addTo(map);
+  }
+
+  async function loadDistricts(provinceId) {
+    setStatus('İlçeler yükleniyor...');
+    var data = await api('/v1/geojson/districts?provinceId=' + provinceId);
+    districtLayer = replaceLayer(districtLayer, data, {
+      style: { color: '#2563eb', weight: 1.5, fillOpacity: 0.05 },
+      interactive: false
+    });
+    map.fitBounds(districtLayer.getBounds());
+    setStatus(data.features.length + ' ilçe çizildi. Haritaya tıklayarak reverse geocoding deneyin.');
+  }
+
+  async function loadNeighborhoods(districtId) {
+    setStatus('Mahalleler yükleniyor...');
+    var data = await api('/v1/geojson/neighborhoods?districtId=' + districtId);
+    neighborhoodLayer = replaceLayer(neighborhoodLayer, data, {
+      style: { color: '#16a34a', weight: 1, fillOpacity: 0.05 },
+      interactive: false
+    });
+    setStatus(data.features.length + ' mahalle çizildi.');
+  }
+
+  async function loadProvinces() {
+    var provinces = await api('/v1/provinces');
+    var select = $('prov');
+    select.innerHTML = '';
+    provinces.forEach(function (p) { select.appendChild(new Option(p.name, String(p.id))); });
+    if (provinces.length > 0) await loadDistricts(provinces[0].id);
+  }
+
+  async function boot() {
+    try { await loadProvinces(); }
+    catch (err) { setStatus(err.message + ' (API key doğru mu?)', true); }
+  }
+
+  $('save').addEventListener('click', function () {
+    key = $('key').value.trim();
+    try { localStorage.setItem('apiKey', key); } catch (e) {}
+    boot();
+  });
+  $('prov').addEventListener('change', function () {
+    loadDistricts($('prov').value).catch(function (err) { setStatus(err.message, true); });
+  });
+
+  // --- Reverse geocoding: haritadaki tıklama -> /v1/locate ---
+  map.on('click', async function (e) {
+    var ll = e.latlng.wrap();
+    try {
+      // Dikkat: Leaflet (lat, lng) kullanır; GeoJSON ve servis çıktıları [lng, lat] sırasındadır.
+      var r = await api('/v1/locate?lat=' + ll.lat + '&lng=' + ll.lng);
+      var path = [r.province.name, r.district && r.district.name, r.neighborhood && r.neighborhood.name]
+        .filter(Boolean).join(' / ');
+
+      var box = document.createElement('div');
+      var title = document.createElement('strong');
+      title.textContent = path;
+      var info = document.createElement('div');
+      var pop = (r.neighborhood || r.district || r.province).population;
+      info.textContent = 'Seviye: ' + r.matchedLevel + ' · Nüfus: ' + pop.toLocaleString('tr-TR');
+      var coord = document.createElement('div');
+      coord.textContent = ll.lat.toFixed(6) + ', ' + ll.lng.toFixed(6);
+      box.appendChild(title); box.appendChild(info); box.appendChild(coord);
+      if (r.district) {
+        var btn = document.createElement('button');
+        btn.textContent = 'Bu ilçenin mahallelerini çiz';
+        btn.addEventListener('click', function () {
+          loadNeighborhoods(r.district.id).catch(function (err) { setStatus(err.message, true); });
+        });
+        box.appendChild(btn);
+      }
+
+      if (pointMarker) map.removeLayer(pointMarker);
+      pointMarker = L.circleMarker(ll, { radius: 6, color: '#dc2626' }).addTo(map).bindPopup(box).openPopup();
+
+      var geometryUrl = r.neighborhood ? '/v1/neighborhoods/' + r.neighborhood.id + '/geometry'
+        : r.district ? '/v1/districts/' + r.district.id + '/geometry'
+        : '/v1/provinces/' + r.province.id + '/geometry';
+      highlightLayer = replaceLayer(highlightLayer, await api(geometryUrl), {
+        style: { color: '#dc2626', weight: 2, fillOpacity: 0.2 }, interactive: false
+      });
+      setStatus(path);
+    } catch (err) {
+      setStatus(err.message, true);
+    }
+  });
+
+  if (key) boot();
+</script>
+</body>
+</html>

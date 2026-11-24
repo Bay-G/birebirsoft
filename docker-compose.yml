@@ -1,0 +1,83 @@
+# address-services — tek komutla tam yığın: PostgreSQL+PostGIS, veri aktarımı ve API.
+#
+#   bun run init:env          # .env üretir (rastgele şifre ve API anahtarı)  [veya: copy .env.example .env]
+#   docker compose up -d --build
+#   curl -H "x-api-key: <API_KEYS>" http://localhost:3000/v1/provinces
+#
+# Başlatma sırası: db (sağlıklı) -> importer (veri boşsa aktarır, bitince çıkar) -> api
+# Veriyi yeniden yüklemek için:
+#   docker compose run --rm importer bun scripts/import-postgis.ts --reset
+# Her şeyi (veritabanı verisi dahil) silmek için:  docker compose down -v
+
+name: address-services
+
+x-app-build: &app-build
+  context: .
+  dockerfile: Dockerfile
+  args:
+    NPM_REGISTRY: ${NPM_REGISTRY:-}
+
+x-database-url: &database-url
+  DATABASE_URL: postgres://${DB_USER:-address}:${DB_PASSWORD:?DB_PASSWORD gerekli (.env dosyasına yazın)}@db:5432/${DB_NAME:-address}
+
+services:
+  db:
+    image: postgis/postgis:16-3.4
+    environment:
+      POSTGRES_USER: ${DB_USER:-address}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD gerekli (.env dosyasına yazın)}
+      POSTGRES_DB: ${DB_NAME:-address}
+    ports:
+      # Yalnızca bu makineden erişim (DBeaver/psql/bun run dev için). 5433: yerel PostgreSQL ile çakışmasın.
+      - "127.0.0.1:${DB_PORT:-5433}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Boş veritabanı ilk kez oluşturulurken şema (eklentiler, tablolar, indeksler) otomatik kurulur.
+      - ./db/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  # Tek seferlik iş: veritabanı boşsa data/ altındaki GeoJSON'ları yükler, doluysa atlar; sonra çıkar.
+  importer:
+    build: *app-build
+    image: address-services:latest
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      <<: *database-url
+      DATA_DIR: /app/data
+    volumes:
+      - ./data:/app/data:ro
+    command: ["bun", "scripts/import-postgis.ts", "--if-empty"]
+    restart: "no"
+
+  api:
+    build: *app-build
+    image: address-services:latest
+    depends_on:
+      db:
+        condition: service_healthy
+      importer:
+        condition: service_completed_successfully
+    ports:
+      - "${APP_PORT:-3000}:3000"
+    environment:
+      <<: *database-url
+      NODE_ENV: production
+      DEMO_ENABLED: ${DEMO_ENABLED:-false}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      REQUEST_LOG_DB: "true"
+      LOG_RETENTION_DAYS: ${LOG_RETENTION_DAYS:-30}
+      # Production'da her anahtar en az 24 karakter olmalı (bkz. .env)
+      API_KEYS: ${API_KEYS:?API_KEYS gerekli (.env dosyasına yazın)}
+      REPOSITORY_DRIVER: postgis
+    restart: unless-stopped
+    mem_limit: 512m
+
+volumes:
+  pgdata:
